@@ -1,14 +1,12 @@
 import asyncio
-import os
 from typing import AsyncIterator, List
 
 from fastapi import HTTPException
-from llama_index.core.llms import LLM
-from llama_index.llms.groq import Groq
-from llama_index.llms.ollama import Ollama
-from llama_index.llms.openai import OpenAI
+from sqlalchemy.orm import Session
 
-from backend.constants import ChatModel, model_mappings
+from backend.constants import get_model_string
+from backend.db.chat import save_turn_to_db
+from backend.llm.base import BaseLLM, EveryLLM
 from backend.prompts import CHAT_PROMPT, HISTORY_QUERY_REPHRASE
 from backend.related_queries import generate_related_queries
 from backend.schemas import (
@@ -28,40 +26,23 @@ from backend.search.search_service import perform_search
 from backend.utils import is_local_model
 
 
-def rephrase_query_with_history(question: str, history: List[Message], llm: LLM) -> str:
+def rephrase_query_with_history(
+    question: str, history: List[Message], llm: BaseLLM
+) -> str:
+    if not history:
+        return question
+
     try:
-        if history:
-            history_str = "\n".join([f"{msg.role}: {msg.content}" for msg in history])
-            question = llm.complete(
-                HISTORY_QUERY_REPHRASE.format(
-                    chat_history=history_str, question=question
-                )
-            ).text
-            question = question.replace('"', "")
+        history_str = "\n".join(f"{msg.role}: {msg.content}" for msg in history)
+        formatted_query = HISTORY_QUERY_REPHRASE.format(
+            chat_history=history_str, question=question
+        )
+        question = llm.complete(formatted_query).text.replace('"', "")
         return question
     except Exception:
         raise HTTPException(
             status_code=500, detail="Model is at capacity. Please try again later."
         )
-
-
-def get_llm(model: ChatModel) -> LLM:
-    if model in [ChatModel.GPT_3_5_TURBO, ChatModel.GPT_4o]:
-        return OpenAI(model=model_mappings[model])
-    elif model in [
-        ChatModel.LOCAL_GEMMA,
-        ChatModel.LOCAL_LLAMA_3,
-        ChatModel.LOCAL_MISTRAL,
-        ChatModel.LOCAL_PHI3_14B,
-    ]:
-        return Ollama(
-            base_url=os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
-            model=model_mappings[model],
-        )
-    elif model == ChatModel.LLAMA_3_70B:
-        return Groq(model=model_mappings[model])
-    else:
-        raise ValueError(f"Unknown model: {model}")
 
 
 def format_context(search_results: List[SearchResult]) -> str:
@@ -70,9 +51,12 @@ def format_context(search_results: List[SearchResult]) -> str:
     )
 
 
-async def stream_qa_objects(request: ChatRequest) -> AsyncIterator[ChatResponseEvent]:
+async def stream_qa_objects(
+    request: ChatRequest, session: Session
+) -> AsyncIterator[ChatResponseEvent]:
     try:
-        llm = get_llm(request.model)
+        model_name = get_model_string(request.model)
+        llm = EveryLLM(model=model_name)
 
         yield ChatResponseEvent(
             event=StreamEvent.BEGIN_STREAM,
@@ -90,7 +74,7 @@ async def stream_qa_objects(request: ChatRequest) -> AsyncIterator[ChatResponseE
         related_queries_task = None
         if not is_local_model(request.model):
             related_queries_task = asyncio.create_task(
-                generate_related_queries(query, search_results, request.model)
+                generate_related_queries(query, search_results, llm)
             )
 
         yield ChatResponseEvent(
@@ -107,7 +91,7 @@ async def stream_qa_objects(request: ChatRequest) -> AsyncIterator[ChatResponseE
         )
 
         full_response = ""
-        response_gen = await llm.astream_complete(fmt_qa_prompt)
+        response_gen = await llm.astream(fmt_qa_prompt)
         async for completion in response_gen:
             full_response += completion.delta or ""
             yield ChatResponseEvent(
@@ -118,7 +102,7 @@ async def stream_qa_objects(request: ChatRequest) -> AsyncIterator[ChatResponseE
         related_queries = await (
             related_queries_task
             if related_queries_task
-            else generate_related_queries(query, search_results, request.model)
+            else generate_related_queries(query, search_results, llm)
         )
 
         yield ChatResponseEvent(
@@ -126,15 +110,27 @@ async def stream_qa_objects(request: ChatRequest) -> AsyncIterator[ChatResponseE
             data=RelatedQueriesStream(related_queries=related_queries),
         )
 
-        yield ChatResponseEvent(
-            event=StreamEvent.STREAM_END,
-            data=StreamEndStream(),
+        thread_id = save_turn_to_db(
+            session=session,
+            thread_id=request.thread_id,
+            user_message=request.query,
+            assistant_message=full_response,
+            model=request.model,
+            search_results=search_results,
+            image_results=images,
+            related_queries=related_queries,
         )
 
         yield ChatResponseEvent(
             event=StreamEvent.FINAL_RESPONSE,
             data=FinalResponseStream(message=full_response),
         )
+
+        yield ChatResponseEvent(
+            event=StreamEvent.STREAM_END,
+            data=StreamEndStream(thread_id=thread_id),
+        )
+
     except Exception as e:
         detail = str(e)
         raise HTTPException(status_code=500, detail=detail)

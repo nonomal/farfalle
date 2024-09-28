@@ -1,34 +1,50 @@
+import os
 from enum import Enum
 
-GPT4_MODEL = "gpt-4o"
-GPT3_MODEL = "gpt-3.5-turbo"
-LLAMA_8B_MODEL = "llama3-8b-8192"
-LLAMA_70B_MODEL = "llama3-70b-8192"
+from dotenv import load_dotenv
 
-LOCAL_LLAMA3_MODEL = "llama3"
-LOCAL_GEMMA_MODEL = "gemma:7b"
-LOCAL_MISTRAL_MODEL = "mistral"
-LOCAL_PHI3_14B = "phi3:14b"
+load_dotenv()
 
 
 class ChatModel(str, Enum):
     LLAMA_3_70B = "llama-3-70b"
     GPT_4o = "gpt-4o"
-    GPT_3_5_TURBO = "gpt-3.5-turbo"
+    GPT_4o_mini = "gpt-4o-mini"
+    COMMAND_R = "command-r"
 
     # Local models
-    LOCAL_LLAMA_3 = "llama3"
+    LOCAL_LLAMA_3 = "llama3.1"
     LOCAL_GEMMA = "gemma"
     LOCAL_MISTRAL = "mistral"
     LOCAL_PHI3_14B = "phi3:14b"
 
+    # Custom models
+    CUSTOM = "custom"
+
 
 model_mappings: dict[ChatModel, str] = {
-    ChatModel.GPT_3_5_TURBO: GPT3_MODEL,
-    ChatModel.GPT_4o: GPT4_MODEL,
-    ChatModel.LLAMA_3_70B: LLAMA_70B_MODEL,
-    ChatModel.LOCAL_LLAMA_3: LOCAL_LLAMA3_MODEL,
-    ChatModel.LOCAL_GEMMA: LOCAL_GEMMA_MODEL,
-    ChatModel.LOCAL_MISTRAL: LOCAL_MISTRAL_MODEL,
-    ChatModel.LOCAL_PHI3_14B: LOCAL_PHI3_14B,
+    ChatModel.GPT_4o: "openai/gpt-4o",
+    ChatModel.GPT_4o_mini: "openai/gpt-4o-mini",
+    ChatModel.LLAMA_3_70B: "groq/llama-3.1-70b-versatile",
+    ChatModel.LOCAL_LLAMA_3: "ollama_chat/llama3.1",
+    ChatModel.LOCAL_GEMMA: "ollama_chat/gemma",
+    ChatModel.LOCAL_MISTRAL: "ollama_chat/mistral",
+    ChatModel.LOCAL_PHI3_14B: "ollama_chat/phi3:14b",
 }
+
+
+def get_model_string(model: ChatModel) -> str:
+    if model == ChatModel.CUSTOM:
+        custom_model = os.environ.get("CUSTOM_MODEL")
+        if custom_model is None:
+            raise ValueError("CUSTOM_MODEL is not set")
+        return custom_model
+
+    if model in {ChatModel.GPT_4o_mini, ChatModel.GPT_4o}:
+        openai_mode = os.environ.get("OPENAI_MODE", "openai")
+        if openai_mode == "azure":
+            # Currently deployments are named "gpt-35-turbo" and "gpt-4o"
+            name = model_mappings[model].replace(".", "")
+            return f"azure/{name}"
+
+    return model_mappings[model]
